@@ -10,6 +10,14 @@ all: $(BUILD)/gtpu $(BUILD)/tun_probe $(BUILD)/test_gtpu
 $(BUILD)/gtpu: $(SRCS) $(HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(SRCS)
 
+# AddressSanitizer + UBSan: memory errors, leaks, undefined behaviour
+$(BUILD)/gtpu_asan: $(SRCS) $(HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(SRCS)
+
+# ThreadSanitizer: data races (cannot be combined with ASan)
+$(BUILD)/gtpu_tsan: $(SRCS) $(HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -fsanitize=thread -o $@ $(SRCS)
+
 $(BUILD)/tun_probe: tests/tun_probe.c src/tun.c include/tun.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/tun_probe.c src/tun.c
 
