@@ -20,5 +20,3 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all clean test
-.gitignore
-build/
