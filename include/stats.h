@@ -4,7 +4,9 @@
 #include <stdatomic.h>
 
 struct stats {
-    atomic_ullong tx_pkts, tx_bytes, rx_pkts, rx_bytes, echo_rx;
+    atomic_ullong tx_pkts, tx_bytes, rx_pkts, rx_bytes;
+    atomic_ullong echo_tx, echo_rx, echo_resp_rx, echo_timeout;
+    atomic_ullong peer_down, peer_recovered;
     atomic_ullong drop_no_session, drop_unknown_teid, drop_malformed;
     atomic_ullong drop_non_ipv4, drop_unsupported, drop_spoofed;
     atomic_ullong send_err, tun_write_err;

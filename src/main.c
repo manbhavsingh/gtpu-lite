@@ -16,10 +16,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BUF_SZ  4096
 #define POLL_MS 500
+
+#define ECHO_INTERVAL_MS 2000ULL
+#define ECHO_TIMEOUT_MS  1000ULL
+#define ECHO_MAX_MISSES  3U
 
 enum role { ROLE_GNB, ROLE_UPF };
 
@@ -31,12 +36,154 @@ struct ctx {
     struct session_table sessions;
     struct stats         stats;
     atomic_int           running;
+
+    struct {
+        pthread_mutex_t lock;
+        uint16_t next_seq;
+        uint16_t pending_seq;
+        uint64_t deadline_ms;
+        uint64_t next_send_ms;
+        unsigned misses;
+        int pending;
+        int peer_up;
+    } echo;
 };
 
 /* Worker hit an unrecoverable error: ask main thread to shut down. */
 static void request_stop(void)
 {
     kill(getpid(), SIGTERM);
+}
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+
+    return (uint64_t)ts.tv_sec * 1000ULL +
+           (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static int same_peer(const struct ctx *c, const struct sockaddr_in *from)
+{
+    return from->sin_family == c->peer.sin_family &&
+           from->sin_port == c->peer.sin_port &&
+           from->sin_addr.s_addr == c->peer.sin_addr.s_addr;
+}
+
+/* Periodically send GTP-U Echo Requests and track peer liveness. */
+static void *echo_keepalive(void *arg)
+{
+    struct ctx *c = arg;
+    uint8_t out[64];
+
+    while (atomic_load(&c->running)) {
+        struct timespec sleep_for = {
+            .tv_sec = 0,
+            .tv_nsec = 100000000L
+        };
+
+        nanosleep(&sleep_for, NULL);
+
+        if (!atomic_load(&c->running))
+            break;
+
+        uint64_t now = monotonic_ms();
+        uint16_t seq = 0;
+        int send_probe = 0;
+        int peer_down = 0;
+        int timed_out = 0;
+
+        pthread_mutex_lock(&c->echo.lock);
+
+        if (c->echo.pending && now >= c->echo.deadline_ms) {
+            c->echo.pending = 0;
+            c->echo.misses++;
+            timed_out = 1;
+
+            if (c->echo.misses >= ECHO_MAX_MISSES &&
+                c->echo.peer_up) {
+                c->echo.peer_up = 0;
+                peer_down = 1;
+            }
+        }
+
+        if (!c->echo.pending && now >= c->echo.next_send_ms) {
+            seq = ++c->echo.next_seq;
+            c->echo.pending = 1;
+            c->echo.pending_seq = seq;
+            c->echo.deadline_ms = now + ECHO_TIMEOUT_MS;
+            c->echo.next_send_ms = now + ECHO_INTERVAL_MS;
+            send_probe = 1;
+        }
+
+        pthread_mutex_unlock(&c->echo.lock);
+
+        if (timed_out)
+            STAT_INC(&c->stats, echo_timeout);
+
+        if (peer_down) {
+            STAT_INC(&c->stats, peer_down);
+            LOGW("peer down: %u consecutive GTP-U Echo timeouts",
+                 ECHO_MAX_MISSES);
+        }
+
+        if (!send_probe)
+            continue;
+
+        int len = gtpu_build_echo(out, sizeof out,
+                                  GTPU_MSG_ECHO_REQ, seq);
+
+        if (len < 0) {
+            LOGE("failed to build Echo Request");
+
+            pthread_mutex_lock(&c->echo.lock);
+            if (c->echo.pending && c->echo.pending_seq == seq)
+                c->echo.pending = 0;
+            pthread_mutex_unlock(&c->echo.lock);
+            continue;
+        }
+
+        ssize_t sent = sendto(c->udp_fd, out, (size_t)len, 0,
+                              (struct sockaddr *)&c->peer,
+                              sizeof c->peer);
+
+        if (sent < 0) {
+            STAT_INC(&c->stats, send_err);
+            LOGW("Echo Request sendto: %s", strerror(errno));
+
+            int down = 0;
+
+            pthread_mutex_lock(&c->echo.lock);
+
+            if (c->echo.pending && c->echo.pending_seq == seq) {
+                c->echo.pending = 0;
+                c->echo.misses++;
+
+                if (c->echo.misses >= ECHO_MAX_MISSES &&
+                    c->echo.peer_up) {
+                    c->echo.peer_up = 0;
+                    down = 1;
+                }
+            }
+
+            pthread_mutex_unlock(&c->echo.lock);
+
+            if (down) {
+                STAT_INC(&c->stats, peer_down);
+                LOGW("peer down: Echo Request transmission failed");
+            }
+
+            continue;
+        }
+
+        STAT_INC(&c->stats, echo_tx);
+        LOGD("echo tx: seq=%u", seq);
+    }
+
+    return NULL;
 }
 
 /* UE-side packets read from TUN -> encapsulate -> UDP to peer */
@@ -146,15 +293,67 @@ static void *udp_to_tun(void *arg)
 
         if (v.msg_type == GTPU_MSG_ECHO_REQ) {
             uint16_t seq = 0;
+
             if ((buf[0] & 0x02) && n >= 12)
                 seq = (uint16_t)((buf[8] << 8) | buf[9]);
-            int len = gtpu_build_echo(out, sizeof out, GTPU_MSG_ECHO_RESP, seq);
+
+            int len = gtpu_build_echo(out, sizeof out,
+                                      GTPU_MSG_ECHO_RESP, seq);
+
             if (len > 0)
                 sendto(c->udp_fd, out, (size_t)len, 0,
                        (struct sockaddr *)&from, fl);
+
             STAT_INC(&c->stats, echo_rx);
             continue;
         }
+
+        if (v.msg_type == GTPU_MSG_ECHO_RESP) {
+            if (!same_peer(c, &from)) {
+                LOGD("ignoring Echo Response from unexpected peer");
+                continue;
+            }
+
+            if (!(buf[0] & 0x02) || n < 12) {
+                STAT_INC(&c->stats, drop_malformed);
+                LOGD("drop: Echo Response missing sequence number");
+                continue;
+            }
+
+            uint16_t seq = (uint16_t)((buf[8] << 8) | buf[9]);
+            int matched = 0;
+            int recovered = 0;
+
+            pthread_mutex_lock(&c->echo.lock);
+
+            if (c->echo.pending && c->echo.pending_seq == seq) {
+                c->echo.pending = 0;
+                c->echo.misses = 0;
+                matched = 1;
+
+                if (!c->echo.peer_up) {
+                    c->echo.peer_up = 1;
+                    recovered = 1;
+                }
+            }
+
+            pthread_mutex_unlock(&c->echo.lock);
+
+            STAT_INC(&c->stats, echo_resp_rx);
+
+            if (matched)
+                LOGD("echo rx: seq=%u matched", seq);
+            else
+                LOGD("echo rx: seq=%u unmatched", seq);
+
+            if (recovered) {
+                STAT_INC(&c->stats, peer_recovered);
+                LOGI("peer recovered: Echo Response seq=%u", seq);
+            }
+
+            continue;
+        }
+
         if (v.msg_type != GTPU_MSG_GPDU) {
             STAT_INC(&c->stats, drop_unsupported);
             continue;
@@ -285,17 +484,57 @@ int main(int argc, char **argv)
     sigaddset(&set, SIGUSR1);
     pthread_sigmask(SIG_BLOCK, &set, NULL);
 
-    pthread_t t_up, t_down;
-    int e = pthread_create(&t_up, NULL, tun_to_udp, &c);
+    int e = pthread_mutex_init(&c.echo.lock, NULL);
     if (e) {
-        LOGE("pthread_create: %s", strerror(e));
+        LOGE("pthread_mutex_init: %s", strerror(e));
+        close(c.udp_fd);
+        close(c.tun_fd);
+        session_table_destroy(&c.sessions);
         return 1;
     }
+
+    c.echo.peer_up = 1;
+    c.echo.next_seq = 0;
+    c.echo.next_send_ms = 0;
+    c.echo.pending = 0;
+    c.echo.pending_seq = 0;
+    c.echo.deadline_ms = 0;
+    c.echo.misses = 0;
+
+    pthread_t t_up, t_down, t_echo;
+
+    e = pthread_create(&t_up, NULL, tun_to_udp, &c);
+    if (e) {
+        LOGE("pthread_create: %s", strerror(e));
+        pthread_mutex_destroy(&c.echo.lock);
+        close(c.udp_fd);
+        close(c.tun_fd);
+        session_table_destroy(&c.sessions);
+        return 1;
+    }
+
     e = pthread_create(&t_down, NULL, udp_to_tun, &c);
     if (e) {
         LOGE("pthread_create: %s", strerror(e));
         atomic_store(&c.running, 0);
         pthread_join(t_up, NULL);
+        pthread_mutex_destroy(&c.echo.lock);
+        close(c.udp_fd);
+        close(c.tun_fd);
+        session_table_destroy(&c.sessions);
+        return 1;
+    }
+
+    e = pthread_create(&t_echo, NULL, echo_keepalive, &c);
+    if (e) {
+        LOGE("pthread_create: %s", strerror(e));
+        atomic_store(&c.running, 0);
+        pthread_join(t_up, NULL);
+        pthread_join(t_down, NULL);
+        pthread_mutex_destroy(&c.echo.lock);
+        close(c.udp_fd);
+        close(c.tun_fd);
+        session_table_destroy(&c.sessions);
         return 1;
     }
 
@@ -315,12 +554,17 @@ int main(int argc, char **argv)
 
     LOGI("shutting down");
     atomic_store(&c.running, 0);
+
     pthread_join(t_up, NULL);
     pthread_join(t_down, NULL);
+    pthread_join(t_echo, NULL);
+
     stats_print(&c.stats);
 
     close(c.udp_fd);
     close(c.tun_fd);
     session_table_destroy(&c.sessions);
+    pthread_mutex_destroy(&c.echo.lock);
+
     return 0;
 }
