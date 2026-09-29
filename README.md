@@ -314,8 +314,4 @@ gtpu-lite/
 
 Natural next steps include dynamic session management, hash-based session lookup, richer GTP-U extension support, packet-rate/latency benchmarking, CI for sanitizer builds, PCAP regression tests, and PFCP/control-plane integration.
 
-## Interview focus
-
-Be ready to explain why GTP-U is used, why UDP/2152 is used, what TEID represents, why TUN and namespaces were chosen, how UL/DL TEIDs are selected, how the worker threads interact, why the session table uses a read/write lock, why counters are atomic, how Echo failure/recovery works, how malformed/spoofed packets are handled, how the 1464 MTU was derived, and how packet capture plus sanitizers/Valgrind were used.
-
 See the [architecture document](docs/architecture.md) for the detailed topology and packet paths.
